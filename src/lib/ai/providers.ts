@@ -217,8 +217,10 @@ function toPromptText(messages: UpstreamMessage[]): string {
 const LLM7_MODEL_MAP: Record<string, string> = {
   "deepseek-v4-flash": "DeepSeek-V4-Flash-0731",
   "deepseek-v3": "DeepSeek-V3-0324",
+  "deepseek-r1": "DeepSeek-R1-0528",
   "openai-fast": "DeepSeek-V4-Flash-0731",
   "gpt-oss-20b": "gpt-oss:20b",
+  "gpt-oss-120b": "gpt-oss:120b",
 };
 
 async function callLlm7(
