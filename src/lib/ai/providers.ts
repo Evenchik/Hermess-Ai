@@ -335,13 +335,95 @@ async function callPollinationsGet(
   return { content: t, reasoning: "" };
 }
 
+// ── REAL STREAMING for free tier (убирает ожидание 10-20с пока весь ответ соберётся) ──
+async function* llm7StreamDirect(opts: {
+  model: string;
+  messages: UpstreamMessage[];
+  signal?: AbortSignal;
+}): AsyncGenerator<StreamEvent> {
+  const msgs = truncateMessagesForFreeTier(opts.messages, 14_000);
+  const res = await fetch("https://api.llm7.io/v1/chat/completions", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ model: opts.model, messages: msgs, stream: true }),
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    const retryAfter = detectRetryAfterMs(text, res.headers) ?? (res.status === 429 ? 8000 : 1500);
+    throw new RateLimitError(`LLM7 stream ${res.status}: ${text.slice(0, 250)}`, retryAfter);
+  }
+  if (!res.body) throw new Error("LLM7 stream пустой body");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      let json: any;
+      try { json = JSON.parse(payload); } catch { continue; }
+      const delta = json.choices?.[0]?.delta ?? {};
+      const reasoning = (delta.reasoning_content as string) ?? (delta.reasoning as string);
+      const content = delta.content as string | undefined;
+      if (reasoning) yield { type: "reasoning", delta: reasoning } as StreamEvent;
+      if (content) yield { type: "text", delta: content } as StreamEvent;
+    }
+  }
+}
+
+async function* pollinationsStreamDirect(opts: {
+  messages: UpstreamMessage[];
+  signal?: AbortSignal;
+}): AsyncGenerator<StreamEvent> {
+  const msgs = truncateMessagesForFreeTier(opts.messages, 12_000);
+  const res = await fetch("https://text.pollinations.ai/openai", {
+    method: "POST",
+    headers: POLLINATION_HEADERS,
+    body: JSON.stringify({ model: "openai-fast", messages: msgs, stream: true }),
+    signal: opts.signal,
+  });
+  if (!res.ok) {
+    const text = await res.text().catch(() => "");
+    const retryAfter = detectRetryAfterMs(text, res.headers) ?? (res.status === 429 ? 9000 : 2000);
+    throw new RateLimitError(`Pollinations stream ${res.status}`, retryAfter);
+  }
+  if (!res.body) throw new Error("Pollinations stream пустой body");
+  const reader = res.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = "";
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split("\n");
+    buffer = lines.pop() ?? "";
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t.startsWith("data:")) continue;
+      const payload = t.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+      let json: any;
+      try { json = JSON.parse(payload); } catch { continue; }
+      const delta = json.choices?.[0]?.delta ?? {};
+      const content = delta.content as string | undefined;
+      const reasoning = (delta.reasoning_content as string) ?? (delta.reasoning as string);
+      if (reasoning) yield { type: "reasoning", delta: reasoning } as StreamEvent;
+      if (content) yield { type: "text", delta: content } as StreamEvent;
+    }
+  }
+}
+
 /**
- * Keyless free tier. Routes the selected model to its real model on LLM7
- * (so "DeepSeek V4 Flash" and "GPT-OSS 20B" are genuinely different models)
- * and simulates a smooth token stream to the UI. Pollinations acts as a
- * fallback when LLM7 is unavailable or rate-limited.
- * Robust against token overflow and rate limits that previously caused
- * silence after 2-3 turns.
+ * Keyless free tier. Пытается СНАЧАЛА реальный стрим (токены сразу), потом фолбеки.
+ * Раньше ждал весь ответ 10-20с и только потом имитировал печать — отсюда "очень долго".
  */
 export async function* freeTierStream(opts: {
   model?: string;
@@ -351,58 +433,81 @@ export async function* freeTierStream(opts: {
   const llm7Model =
     LLM7_MODEL_MAP[opts.model ?? "deepseek-v4-flash"] ?? "DeepSeek-V4-Flash-0731";
 
-  let result: GenerateResult | null = null;
-  // Pre-truncate once for all providers (keeps tail of conversation)
   const baseMessages = truncateMessagesForFreeTier(opts.messages, 14_000);
 
-  // 1) Primary: the exact requested model via LLM7.
+  // 0) Попытка реального стрима LLM7 — токены летят сразу (~1с до первого)
+  try {
+    let yielded = false;
+    for await (const ev of llm7StreamDirect({ model: llm7Model, messages: baseMessages, signal: opts.signal })) {
+      yielded = true;
+      yield ev;
+    }
+    if (yielded) return;
+  } catch (e) {
+    if (opts.signal?.aborted) return;
+    // если rate-limit или сеть — падать в фолбеки ниже, но не ждать долго
+    if (e instanceof RateLimitError) {
+      // небольшой бек-офф перед фолбеком, чтобы не долбить
+      await sleep(Math.min(e.retryAfterMs, 2500));
+    }
+  }
+
+  // 0b) Попытка реального стрима Pollinations
+  try {
+    let yielded = false;
+    for await (const ev of pollinationsStreamDirect({ messages: baseMessages, signal: opts.signal })) {
+      yielded = true;
+      yield ev;
+    }
+    if (yielded) return;
+  } catch {
+    if (opts.signal?.aborted) return;
+  }
+
+  // 1-5) Старые надёжные не-стрим фолбеки (для перегруженных тайров)
+  let result: GenerateResult | null = null;
+
   result = await attemptGenerate(
     () => callLlm7(llm7Model, baseMessages, opts.signal),
-    3,
+    2,
     opts.signal,
-    1500,
+    1200,
   );
 
-  // 2) Fallback: Pollinations OpenAI-compatible endpoint.
   if (!result && !opts.signal?.aborted) {
     result = await attemptGenerate(
       () => callPollinationsOpenAi(baseMessages, opts.signal),
-      2,
-      opts.signal,
-      1500,
-    );
-  }
-
-  // 3) Fallback: Pollinations legacy POST.
-  if (!result && !opts.signal?.aborted) {
-    result = await attemptGenerate(
-      () => callPollinationsPost(baseMessages, opts.signal),
-      2,
-      opts.signal,
-      1500,
-    );
-  }
-
-  // 4) Fallback: Pollinations legacy GET (most resilient, smallest payload).
-  if (!result && !opts.signal?.aborted) {
-    result = await attemptGenerate(
-      () => callPollinationsGet(baseMessages, opts.signal),
-      2,
+      1,
       opts.signal,
       1000,
     );
   }
 
-  // 5) Last resort: aggressively truncated history (keeps only last 4 exchanges)
-  // This handles the "stops after couple messages" case where context overflow
-  // causes upstream 400. We retry primary with tiny context.
+  if (!result && !opts.signal?.aborted) {
+    result = await attemptGenerate(
+      () => callPollinationsPost(baseMessages, opts.signal),
+      1,
+      opts.signal,
+      1000,
+    );
+  }
+
+  if (!result && !opts.signal?.aborted) {
+    result = await attemptGenerate(
+      () => callPollinationsGet(baseMessages, opts.signal),
+      1,
+      opts.signal,
+      800,
+    );
+  }
+
   if (!result && !opts.signal?.aborted) {
     const tiny = truncateMessagesForFreeTier(baseMessages, 4000);
     result = await attemptGenerate(
       () => callLlm7(llm7Model, tiny, opts.signal),
-      2,
+      1,
       opts.signal,
-      1200,
+      800,
     );
   }
 
@@ -429,17 +534,17 @@ export async function* freeTierStream(opts: {
   }
 
   if (result.reasoning.trim()) {
-    for (const chunk of chunkText(result.reasoning, 30)) {
+    for (const chunk of chunkText(result.reasoning, 20)) {
       if (opts.signal?.aborted) return;
       yield { type: "reasoning", delta: chunk };
-      await sleep(4);
+      await sleep(2);
     }
   }
 
-  for (const chunk of chunkText(result.content, 5)) {
+  for (const chunk of chunkText(result.content, 10)) {
     if (opts.signal?.aborted) return;
     yield { type: "text", delta: chunk };
-    await sleep(10);
+    await sleep(5);
   }
 }
 
