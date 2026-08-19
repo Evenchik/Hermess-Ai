@@ -34,3 +34,10 @@ drizzle/
 # ide
 .vscode/
 .idea/
+
+# python
+__pycache__/
+*.pyc
+*.pyo
+tsconfig.tsbuildinfo
+.tmp_db_check.js
