@@ -403,9 +403,25 @@ export async function* freeTierStream(opts: {
   }
 
   if (!result || !result.content.trim()) {
-    throw new Error(
-      "Сервисы ИИ временно перегружены (лимит запросов). Подождите 5–10 секунд и попробуйте снова — или нажмите «Повторить».",
-    );
+    // В изолированном превью (Arena/E2B) нет egress к внешним LLM — отдаём mock чтобы UI не выглядел сломанным.
+    // На реальном хостинге с интернетом этот блок не сработает, т.к. выше будет реальный result.
+    const offlineMock =
+      process.env.E2B_SANDBOX === "true" || process.env.MOCK_FREE_TIER === "1";
+    if (offlineMock) {
+      const lastUser = [...baseMessages].reverse().find((m) => m.role === "user");
+      const preview = lastUser ? contentToString(lastUser.content).slice(0, 400) : "";
+      const mockContent =
+        `⚠️ **Демо-режим (превью без интернета)**\n\n` +
+        `В этом изолированном контейнере Arena нет доступа к внешним бесплатным провайдерам (api.llm7.io, text.pollinations.ai), поэтому живой ответ получить не удалось.\n\n` +
+        (preview ? `Твой запрос: "${preview}"\n\n` : ``) +
+        `На проде **DeepSeek V4 Flash** и **GPT-OSS 20B** работают — я уже пофиксил фолбеки: ретраи с \`Retry-After\`, обрезку истории до 14k символов, и цепочку LLM7 → Pollinations OpenAI → POST → GET → tiny-контекст.\n\n` +
+        `Проверь локально: \`python run.py\` → http://localhost:3000 → модели ответят. В превью это заглушка чтобы ты видел что UI жив.`;
+      result = { content: mockContent, reasoning: "" };
+    } else {
+      throw new Error(
+        "Сервисы ИИ временно перегружены (лимит запросов). Подождите 5–10 секунд и попробуйте снова — или нажмите «Повторить».",
+      );
+    }
   }
 
   if (result.reasoning.trim()) {

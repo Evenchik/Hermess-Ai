@@ -18,9 +18,6 @@ type ChatBody = {
   regenerate?: boolean;
 };
 
-// Clean history server-side as a safety net (client already does it, but
-// malicious or stale clients may send empty assistant turns that break
-// OpenAI-compatible APIs and cause silence after 2-3 messages).
 function cleanHistory(
   history: { role: "user" | "assistant"; content: string }[],
 ): { role: "user" | "assistant"; content: string }[] {
@@ -45,6 +42,16 @@ function cleanHistory(
   return out.slice(-30);
 }
 
+// wrapper to swallow DB errors when Postgres is not available (preview without DB)
+async function tryDb<T>(fn: () => Promise<T>, fallback?: T): Promise<T | undefined> {
+  try {
+    return await fn();
+  } catch (e) {
+    console.warn("[chat] DB unavailable, continuing without persistence:", (e as Error)?.message?.slice(0, 200));
+    return fallback;
+  }
+}
+
 export async function POST(req: Request) {
   let body: ChatBody;
   try {
@@ -56,7 +63,6 @@ export async function POST(req: Request) {
   const model =
     typeof body?.model === "string" && body.model ? body.model : "deepseek-v4-flash";
   const rawHistory = Array.isArray(body?.history) ? body.history.slice(-60) : [];
-  // critical fix: sanitize history to avoid consecutive same-role & empty turns
   const safeHistory = cleanHistory(
     rawHistory as { role: "user" | "assistant"; content: string }[],
   );
@@ -75,7 +81,6 @@ export async function POST(req: Request) {
     return Response.json({ error: "Пустое сообщение" }, { status: 400 });
   }
 
-  // Resolve existing conversation or create a new one.
   let convId: string | null =
     typeof body?.conversationId === "string" && body.conversationId
       ? body.conversationId
@@ -84,13 +89,17 @@ export async function POST(req: Request) {
   let existingSystemPrompt: string | undefined = undefined;
 
   if (convId) {
-    const existing = await db
-      .select({ id: conversations.id, systemPrompt: conversations.systemPrompt })
-      .from(conversations)
-      .where(eq(conversations.id, convId))
-      .limit(1);
-    if (existing.length > 0) {
+    const existing = await tryDb(() =>
+      db
+        .select({ id: conversations.id, systemPrompt: conversations.systemPrompt })
+        .from(conversations)
+        .where(eq(conversations.id, convId!))
+        .limit(1),
+    );
+    if (existing && existing.length > 0) {
       existingSystemPrompt = existing[0].systemPrompt ?? undefined;
+    } else if (!existing) {
+      // DB down — keep convId as is (client-provided), don't null it
     } else {
       convId = null;
     }
@@ -100,46 +109,52 @@ export async function POST(req: Request) {
 
   if (!convId) {
     const title = (text.trim() || "Чат с изображением").slice(0, 60);
-    const [created] = await db
-      .insert(conversations)
-      .values({
-        title,
-        model,
-        systemPrompt: effectiveSystemPrompt ?? null,
-      })
-      .returning({ id: conversations.id });
-    convId = created.id;
+    const created = await tryDb(() =>
+      db
+        .insert(conversations)
+        .values({
+          title,
+          model,
+          systemPrompt: effectiveSystemPrompt ?? null,
+        })
+        .returning({ id: conversations.id }),
+    );
+    if (created && created[0]?.id) {
+      convId = created[0].id;
+    } else {
+      // DB unavailable — generate ephemeral id for preview
+      convId = globalThis.crypto?.randomUUID?.() ?? Math.random().toString(36).slice(2) + Date.now().toString(36);
+    }
   } else if (userSystemPrompt && userSystemPrompt !== existingSystemPrompt) {
-    await db
-      .update(conversations)
-      .set({ systemPrompt: userSystemPrompt, updatedAt: new Date() })
-      .where(eq(conversations.id, convId));
+    await tryDb(() =>
+      db
+        .update(conversations)
+        .set({ systemPrompt: userSystemPrompt, updatedAt: new Date() })
+        .where(eq(conversations.id, convId!)),
+    );
   }
 
   if (regenerate) {
-    // Replace the latest assistant message (the one being regenerated).
-    const latest = await db
-      .select({ id: messages.id })
-      .from(messages)
-      .where(
-        and(
-          eq(messages.conversationId, convId),
-          eq(messages.role, "assistant"),
-        ),
-      )
-      .orderBy(desc(messages.createdAt))
-      .limit(1);
-    if (latest.length > 0) {
-      await db.delete(messages).where(eq(messages.id, latest[0].id));
-    }
-  } else {
-    // Persist the new user message.
-    await db.insert(messages).values({
-      conversationId: convId,
-      role: "user",
-      content: text,
-      images: JSON.stringify(safeImages),
+    await tryDb(async () => {
+      const latest = await db
+        .select({ id: messages.id })
+        .from(messages)
+        .where(and(eq(messages.conversationId, convId!), eq(messages.role, "assistant")))
+        .orderBy(desc(messages.createdAt))
+        .limit(1);
+      if (latest.length > 0) {
+        await db.delete(messages).where(eq(messages.id, latest[0].id));
+      }
     });
+  } else {
+    await tryDb(() =>
+      db.insert(messages).values({
+        conversationId: convId!,
+        role: "user",
+        content: text,
+        images: JSON.stringify(safeImages),
+      }),
+    );
   }
 
   const encoder = new TextEncoder();
@@ -148,40 +163,33 @@ export async function POST(req: Request) {
       const send = (ev: StreamEvent) => {
         try {
           controller.enqueue(encoder.encode(`data: ${JSON.stringify(ev)}\n\n`));
-        } catch {
-          /* stream already closed */
-        }
+        } catch {}
       };
 
       let assistantText = "";
       let reasoning = "";
 
       const persistAssistant = async () => {
-        if (!assistantText.trim()) return; // never persist empty answers
-        try {
-          await db.insert(messages).values({
-            conversationId: convId,
+        if (!assistantText.trim()) return;
+        await tryDb(() =>
+          db.insert(messages).values({
+            conversationId: convId!,
             role: "assistant",
             content: assistantText,
             reasoning: reasoning || null,
             model,
-          });
-        } catch {
-          /* ignore persistence errors on partial writes */
-        }
+          }),
+        );
       };
 
-      // keepalive ping to prevent proxy timeouts during long free-tier waits
       const keepAlive = setInterval(() => {
         try {
           controller.enqueue(encoder.encode(`: ping\n\n`));
-        } catch {
-          /* ignore */
-        }
+        } catch {}
       }, 15_000);
 
       try {
-        send({ type: "meta", conversationId: convId, model });
+        send({ type: "meta", conversationId: convId!, model });
 
         const gen = streamChat({
           model,
@@ -200,10 +208,7 @@ export async function POST(req: Request) {
           send(ev);
         }
 
-        // Guard against empty completions (e.g. a provider returning only
-        // reasoning or nothing at all).
         if (!assistantText.trim()) {
-          // if we have reasoning but no text, surface reasoning as text fallback
           if (reasoning.trim()) {
             assistantText = reasoning;
             reasoning = "";
@@ -221,26 +226,24 @@ export async function POST(req: Request) {
           send({ type: "done" });
           await persistAssistant();
         }
-        await db
-          .update(conversations)
-          .set({ updatedAt: new Date(), model })
-          .where(eq(conversations.id, convId));
+        await tryDb(() =>
+          db
+            .update(conversations)
+            .set({ updatedAt: new Date(), model })
+            .where(eq(conversations.id, convId!)),
+        );
       } catch (err) {
         if (req.signal.aborted) {
           await persistAssistant();
         } else {
-          const message =
-            err instanceof Error ? err.message : "Неизвестная ошибка";
-          // surface provider errors with retry hint
+          const message = err instanceof Error ? err.message : "Неизвестная ошибка";
           send({ type: "error", message });
         }
       } finally {
         clearInterval(keepAlive);
         try {
           controller.close();
-        } catch {
-          /* ignore */
-        }
+        } catch {}
       }
     },
   });
