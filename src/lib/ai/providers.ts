@@ -214,10 +214,11 @@ function toPromptText(messages: UpstreamMessage[]): string {
 }
 
 // Maps our internal model ids to the real LLM7 model ids.
+// ids в нижнем регистре для V3/R1 — так их отдаёт llm7 free tier (freellm.net)
 const LLM7_MODEL_MAP: Record<string, string> = {
   "deepseek-v4-flash": "DeepSeek-V4-Flash-0731",
-  "deepseek-v3": "DeepSeek-V3-0324",
-  "deepseek-r1": "DeepSeek-R1-0528",
+  "deepseek-v3": "deepseek-v3-0324",
+  "deepseek-r1": "deepseek-r1-0528",
   "openai-fast": "DeepSeek-V4-Flash-0731",
   "gpt-oss-20b": "gpt-oss:20b",
   "gpt-oss-120b": "gpt-oss:120b",
