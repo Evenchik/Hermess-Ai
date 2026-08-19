@@ -50,11 +50,11 @@ export const MODELS: ModelInfo[] = [
   {
     id: "gpt-oss-120b",
     label: "GPT-OSS 120B",
-    provider: "llm7",
+    provider: "groq",
     vision: false,
     reasoning: true,
     requiresKey: false,
-    description: "Старший брат 20B — мощная reasoning 120B",
+    description: "Честный 120B — Groq 500 tok/s если GROQ_API_KEY, иначе free llm7",
   },
   {
     id: "gpt-4o",
