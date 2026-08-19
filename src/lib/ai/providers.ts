@@ -216,6 +216,7 @@ function toPromptText(messages: UpstreamMessage[]): string {
 // Maps our internal model ids to the real LLM7 model ids.
 const LLM7_MODEL_MAP: Record<string, string> = {
   "deepseek-v4-flash": "DeepSeek-V4-Flash-0731",
+  "deepseek-v3": "DeepSeek-V3-0324",
   "openai-fast": "DeepSeek-V4-Flash-0731",
   "gpt-oss-20b": "gpt-oss:20b",
 };

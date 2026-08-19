@@ -18,7 +18,16 @@ export const MODELS: ModelInfo[] = [
     vision: false,
     reasoning: false,
     requiresKey: false,
-    description: "Быстрая и точная бесплатная модель DeepSeek",
+    description: "Быстрая и точная бесплатная модель DeepSeek (0731)",
+  },
+  {
+    id: "deepseek-v3",
+    label: "DeepSeek V3",
+    provider: "llm7",
+    vision: false,
+    reasoning: false,
+    requiresKey: false,
+    description: "Мощная бесплатная модель DeepSeek V3 (0324)",
   },
   {
     id: "gpt-oss-20b",
