@@ -216,8 +216,7 @@ export async function* streamChat(req: ChatRequest): AsyncGenerator<StreamEvent>
   if (provider === "openai") {
     yield* openaiStream({ model: info.id, messages, signal: req.signal });
   } else if (provider === "groq") {
-    const groqModel = info.id === "gpt-oss-120b" ? "openai/gpt-oss-120b" : info.id;
-    yield* groqStream({ model: groqModel, messages, signal: req.signal });
+    yield* groqStream({ model: info.id, messages, signal: req.signal });
   } else {
     yield* freeTierStream({
       model: info.id,
